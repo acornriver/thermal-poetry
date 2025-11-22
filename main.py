@@ -614,24 +614,7 @@ class ThermalPoetryApp:
                 if self.print_button_pressed:
                     self.print_button_pressed = False
                     if self.state == STATE_PRINTING:
-                        # Print collected words with their images
-                        if self.printed_words:
-                            # Find the actual Word objects from floating_words
-                            words_to_print = []
-                            for word_text in self.printed_words:
-                                # Find matching Word object
-                                for word_obj in self.floating_words:
-                                    if word_obj.text == word_text:
-                                        words_to_print.append(word_obj)
-                                        break
-                            
-                            # If we couldn't find Word objects, just print text
-                            if not words_to_print:
-                                self.printer.print_receipt(self.printed_words)
-                            else:
-                                self.printer.print_receipt(words_to_print)
-                            
-                            self.printed_words = []
+                        # Just return to floating state (words already printed individually)
                         self.state = STATE_FLOATING
         
         if self.state == STATE_FLOATING:
@@ -699,12 +682,15 @@ class ThermalPoetryApp:
                 # Check if word has reached the left edge
                 if word.x < -100:
                     words_to_remove.append(word)
-                    self.printed_words.append(word.text)
+                    # Print immediately when word is collected
+                    self.printer.print_receipt([word])
                     # Play printer sound when word is "collected"
                     self.printer_sound.play()
-                
-                # Still update vertical motion
-                word.update()
+                else:
+                    # Only update vertical motion (no screen wrapping during printing)
+                    t = time.time() + word.time_offset
+                    word.y += math.sin(t * word.bob_speed) * 0.5
+                    word.rotation += word.rotation_speed
             
             # Remove collected words
             for word in words_to_remove:
@@ -760,18 +746,11 @@ class ThermalPoetryApp:
             border_color = (100, 100, 100)
             pygame.draw.rect(self.screen, border_color, self.print_button_rect, width=1, border_radius=5)
             
-            # Simple text
+            # Button text
             button_text = "인쇄 ←"
             button_surf = self.font.render(button_text, True, (200, 200, 200))
             button_rect = button_surf.get_rect(center=self.print_button_rect.center)
             self.screen.blit(button_surf, button_rect)
-            
-            # Simple counter (no animation)
-            if self.state == STATE_PRINTING and self.printed_words:
-                count_text = f"{len(self.printed_words)}"
-                count_surf = pygame.font.SysFont(None, 20).render(count_text, True, (120, 120, 120))
-                count_rect = count_surf.get_rect(center=(SCREEN_WIDTH // 2, PRINT_BUTTON_Y - 30))
-                self.screen.blit(count_surf, count_rect)
                 
         pygame.display.flip()
 
