@@ -35,6 +35,14 @@ EXPLOSION_DURATION = 3.0  # Seconds for Deconstruction state
 STATE_FLOATING = "FLOATING"
 STATE_TYPING = "TYPING"
 STATE_DECONSTRUCTION = "DECONSTRUCTION"
+STATE_PRINTING = "PRINTING"  # New state for print button held
+
+# --- Print Button Config ---
+PRINT_BUTTON_WIDTH = 200
+PRINT_BUTTON_HEIGHT = 60
+PRINT_BUTTON_Y = SCREEN_HEIGHT - 100
+PRINT_BUTTON_X = (SCREEN_WIDTH - PRINT_BUTTON_WIDTH) // 2
+PRINT_PULL_SPEED = 8.0  # Speed at which words are pulled left
 
 class Word:
     """Represents a floating word in the visualizer."""
@@ -208,6 +216,33 @@ class PrinterManager:
                 print(f"Print failed: {e}")
 
 class ThermalPoetryApp:
+    def create_printer_sound(self, duration=0.04):
+        """Generate a mechanical printer/dot-matrix sound."""
+        sample_rate = 22050
+        n_samples = int(sample_rate * duration)
+        
+        buf = []
+        for i in range(n_samples):
+            t = i / sample_rate
+            # Sharp envelope
+            envelope = math.exp(-t * 50)
+            
+            # Noise-based sound (like mechanical impact)
+            noise = random.uniform(-1, 1)
+            
+            # Add some high-frequency buzz (like motor)
+            buzz = math.sin(2 * math.pi * 3000 * t) * 0.3
+            
+            # Combine
+            value = (noise * 0.7 + buzz * 0.3) * envelope
+            
+            final_value = int(32767 * 0.2 * value)
+            final_value = max(-32767, min(32767, final_value))
+            buf.append([final_value, final_value])
+        
+        sound = pygame.sndarray.make_sound(np.array(buf, dtype=np.int16))
+        return sound
+
     def create_typing_sound(self, base_freq=800, duration=0.08, timbre='bell'):
         """Generate a typing sound with varied timbre."""
         sample_rate = 22050
@@ -278,6 +313,46 @@ class ThermalPoetryApp:
         # Timer for Deconstruction state
         self.deconstruction_start_time = 0
         
+        # Sound FX - Create a pool of varied sounds for word appearance
+        self.typing_sounds = []
+        
+        # Musical scale (pentatonic for pleasant harmony)
+        scale_notes = [261.63, 293.66, 329.63, 392.00, 440.00, 523.25]  # C, D, E, G, A, C
+        timbres = ['bell', 'pluck', 'click', 'soft']
+        
+        # Generate 12 different sounds for word appearance
+        for i in range(12):
+            freq = random.choice(scale_notes)
+            timbre = random.choice(timbres)
+            sound = self.create_typing_sound(freq, duration=random.uniform(0.06, 0.1), timbre=timbre)
+            self.typing_sounds.append(sound)
+        
+        # Printer sound (mechanical, for printing action)
+        self.printer_sound = self.create_printer_sound()
+        
+        # Word appearance tracking for sound sync
+        self.word_appear_queue = []  # [(word, appear_time), ...]
+        self.last_word_sound_time = 0
+        
+        # Print Button
+        self.print_button_rect = pygame.Rect(PRINT_BUTTON_X, PRINT_BUTTON_Y, 
+                                              PRINT_BUTTON_WIDTH, PRINT_BUTTON_HEIGHT)
+        self.print_button_pressed = False
+        self.printed_words = []  # Words that have been printed
+        
+        # Load some initial words
+        self.last_input_time = time.time()
+        
+        # Text Input State
+        self.input_text = "" 
+        self.composition_text = ""
+        pygame.key.start_text_input() # Enable IME
+        
+        self.floating_words = deque(maxlen=50) # FIFO structure with max limit
+        
+        # Timer for Deconstruction state
+        self.deconstruction_start_time = 0
+        
         # Sound FX - Create a pool of varied sounds
         self.typing_sounds = []
         
@@ -295,6 +370,12 @@ class ThermalPoetryApp:
         # Word appearance tracking for sound sync
         self.word_appear_queue = []  # [(word, appear_time), ...]
         self.last_word_sound_time = 0
+        
+        # Print Button
+        self.print_button_rect = pygame.Rect(PRINT_BUTTON_X, PRINT_BUTTON_Y, 
+                                              PRINT_BUTTON_WIDTH, PRINT_BUTTON_HEIGHT)
+        self.print_button_pressed = False
+        self.printed_words = []  # Words that have been printed
         
         # Load some initial words
         initial_words = ["기억", "시간", "흐름", "침묵", "소리", "바람"]
@@ -387,6 +468,26 @@ class ThermalPoetryApp:
     def handle_input(self, event):
         self.last_input_time = time.time()
         
+        # Handle print button (mouse)
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button == 1:  # Left click
+                mouse_pos = event.pos
+                if self.print_button_rect.collidepoint(mouse_pos):
+                    self.print_button_pressed = True
+                    if self.state == STATE_FLOATING:
+                        self.state = STATE_PRINTING
+                        
+        elif event.type == pygame.MOUSEBUTTONUP:
+            if event.button == 1:
+                if self.print_button_pressed:
+                    self.print_button_pressed = False
+                    if self.state == STATE_PRINTING:
+                        # Print collected words
+                        if self.printed_words:
+                            self.printer.print_receipt(self.printed_words)
+                            self.printed_words = []
+                        self.state = STATE_FLOATING
+        
         if self.state == STATE_FLOATING:
             # Any key switches to Typing
             if event.type in [pygame.KEYDOWN, pygame.TEXTINPUT, pygame.TEXTEDITING]:
@@ -398,7 +499,12 @@ class ThermalPoetryApp:
                 self.composition_text = "" # Clear composition
                 
             elif event.type == pygame.TEXTEDITING:
-                self.composition_text = event.text
+                # Only show composition if there's actual text
+                # This prevents showing incomplete jamo (ㅊ, ㅓ, ㅅ)
+                if event.text and len(event.text.strip()) > 0:
+                    self.composition_text = event.text
+                else:
+                    self.composition_text = ""
                 
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_RETURN:
@@ -436,6 +542,27 @@ class ThermalPoetryApp:
             # Just let them float naturally, no jitter
             for word in self.floating_words:
                 word.update()
+                
+        elif self.state == STATE_PRINTING:
+            # Pull words to the left
+            words_to_remove = []
+            for word in self.floating_words:
+                # Pull left
+                word.x -= PRINT_PULL_SPEED
+                
+                # Check if word has reached the left edge
+                if word.x < -100:
+                    words_to_remove.append(word)
+                    self.printed_words.append(word.text)
+                    # Play printer sound when word is "collected"
+                    self.printer_sound.play()
+                
+                # Still update vertical motion
+                word.update()
+            
+            # Remove collected words
+            for word in words_to_remove:
+                self.floating_words.remove(word)
 
     def draw(self):
         self.screen.fill(BG_COLOR)
@@ -448,7 +575,7 @@ class ThermalPoetryApp:
             if int(time.time()) % 2 == 0:
                 guide_text = "아무 키나 눌러 당신의 시를 시작하세요"
                 guide_surf = self.font.render(guide_text, True, (100, 100, 100))
-                guide_rect = guide_surf.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 100))
+                guide_rect = guide_surf.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2))
                 self.screen.blit(guide_surf, guide_rect)
                 
         elif self.state == STATE_TYPING:
@@ -471,6 +598,34 @@ class ThermalPoetryApp:
             # Show words scattering
             for word in self.floating_words:
                 word.draw(self.screen)
+        
+        elif self.state == STATE_PRINTING:
+            # Show words flowing to the left
+            for word in self.floating_words:
+                word.draw(self.screen)
+        
+        # Draw Print Button (minimal design)
+        if self.state in [STATE_FLOATING, STATE_PRINTING]:
+            # Simple button background
+            button_color = (50, 50, 50) if not self.print_button_pressed else (70, 70, 70)
+            pygame.draw.rect(self.screen, button_color, self.print_button_rect, border_radius=5)
+            
+            # Thin border
+            border_color = (100, 100, 100)
+            pygame.draw.rect(self.screen, border_color, self.print_button_rect, width=1, border_radius=5)
+            
+            # Simple text
+            button_text = "인쇄 ←"
+            button_surf = self.font.render(button_text, True, (200, 200, 200))
+            button_rect = button_surf.get_rect(center=self.print_button_rect.center)
+            self.screen.blit(button_surf, button_rect)
+            
+            # Simple counter (no animation)
+            if self.state == STATE_PRINTING and self.printed_words:
+                count_text = f"{len(self.printed_words)}"
+                count_surf = pygame.font.SysFont(None, 20).render(count_text, True, (120, 120, 120))
+                count_rect = count_surf.get_rect(center=(SCREEN_WIDTH // 2, PRINT_BUTTON_Y - 30))
+                self.screen.blit(count_surf, count_rect)
                 
         pygame.display.flip()
 
