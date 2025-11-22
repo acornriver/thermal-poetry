@@ -75,7 +75,7 @@ class Word:
     def generate_word_image(self):
         """Generate a procedural image based on word characteristics."""
         # Use word properties to determine image characteristics
-        word_hash = sum(ord(c) for c in self.text)
+        word_hash = abs(sum(ord(c) for c in self.text))
         
         # Image size
         size = 60 + (word_hash % 40)
@@ -96,7 +96,7 @@ class Word:
             num_circles = 3 + (word_hash % 3)
             for i in range(num_circles):
                 radius = size // 2 - (i * size // (num_circles * 2))
-                alpha = 150 - (i * 40)
+                alpha = max(50, 150 - (i * 40))  # Ensure alpha is positive
                 color = (brightness, brightness, brightness, alpha)
                 pygame.draw.circle(surf, color, (center, center), radius, 2)
         
