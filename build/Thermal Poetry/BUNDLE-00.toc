@@ -1,0 +1,3 @@
+([('Thermal Poetry',
+   '/Users/acornriver/Documents/GitHub/thermal-poetry/dist/Thermal Poetry',
+   'EXECUTABLE')],)

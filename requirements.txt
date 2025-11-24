@@ -1,3 +1,5 @@
 pygame
 konlpy
 python-escpos
+sounddevice
+numpy
