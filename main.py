@@ -5,6 +5,7 @@ import math
 import pygame
 import numpy as np
 from collections import deque
+import threading
 from PIL import Image, ImageOps
 import sounddevice as sd
 
@@ -75,6 +76,14 @@ class Word:
         # Base position (for wave calculation)
         self.base_x = x
         self.base_y = y
+
+        # --- CACHING: Pre-render surfaces ---
+        # 1. Shadow
+        shadow_color = (40, 40, 40)
+        self.original_shadow = self.font.render(self.text, True, shadow_color)
+        
+        # 2. Main Text
+        self.original_text = self.font.render(self.text, True, FONT_COLOR)
     
     def update(self, current_time):
         """Update word position with pure physics-based motion."""
@@ -89,122 +98,59 @@ class Word:
         # Update rotation
         self.rotation += self.rotation_speed
     
-    def OLD_generate_word_image(self):
-        """Generate a procedural artistic image based on word characteristics."""
-        # Seed random generator with word content for consistency per word
-        # (Or use time if we want it to be different every time the same word appears)
-        seed_val = abs(sum(ord(c) for c in self.text))
-        rng = random.Random(seed_val)
-        
-        # Image size - slightly larger for better detail
-        size = 120 + (seed_val % 80)
-        surf = pygame.Surface((size, size), pygame.SRCALPHA)
-        
-        # Styles
-        styles = ['flow', 'geo', 'organic', 'glitch']
-        style = styles[seed_val % len(styles)]
-        
-        # Base brightness/alpha
-        brightness = 0  # Black patterns on white/transparent
-        
-        center = size // 2
-        
-        if style == 'flow':
-            # Flow Field: Particles following trig-based vectors
-            num_particles = 100
-            steps = 30
-            for _ in range(num_particles):
-                px = rng.randint(0, size)
-                py = rng.randint(0, size)
-                points = []
-                
-                for _ in range(steps):
-                    # Create a pseudo-vector field using sin/cos and word hash
-                    angle = math.sin(px * 0.05 + seed_val) + math.cos(py * 0.05) * math.pi * 2
-                    px += math.cos(angle) * 3
-                    py += math.sin(angle) * 3
-                    points.append((px, py))
-                
-                if len(points) > 1:
-                    alpha = rng.randint(50, 200)
-                    color = (255, 255, 255, alpha) # White for display (inverted for print usually)
-                    # Note: The original code used (brightness, brightness, brightness) which was ~100-200 (grey)
-                    # Let's stick to high contrast for thermal printing logic later
-                    c_val = rng.randint(150, 255)
-                    pygame.draw.lines(surf, (c_val, c_val, c_val, alpha), False, points, 1)
-
-        elif style == 'geo':
-            # Geometric Chaos: Overlapping translucent shapes
-            num_shapes = 5 + (seed_val % 5)
-            for i in range(num_shapes):
-                w = rng.randint(10, size // 2)
-                h = rng.randint(10, size // 2)
-                x = rng.randint(0, size - w)
-                y = rng.randint(0, size - h)
-                
-                alpha = rng.randint(50, 150)
-                color = (200, 200, 200, alpha)
-                
-                shape_type = rng.choice(['rect', 'circle', 'line'])
-                
-                if shape_type == 'rect':
-                    pygame.draw.rect(surf, color, (x, y, w, h), 1)
-                    # Sometimes fill
-                    if rng.random() > 0.7:
-                        pygame.draw.rect(surf, (200, 200, 200, 30), (x, y, w, h))
-                elif shape_type == 'circle':
-                    pygame.draw.circle(surf, color, (x + w//2, y + h//2), w//2, 1)
-                elif shape_type == 'line':
-                    pygame.draw.line(surf, color, (x, y), (x+w, y+h), 2)
-
-        elif style == 'organic':
-            # Organic Growth: Recursive branching or circles
-            def draw_branch(surface, x, y, length, angle, depth):
-                if depth == 0: return
-                end_x = x + length * math.cos(angle)
-                end_y = y + length * math.sin(angle)
-                
-                c_val = 150 + depth * 10
-                pygame.draw.line(surface, (c_val, c_val, c_val, 180), (x, y), (end_x, end_y), max(1, depth))
-                
-                # Branch out
-                draw_branch(surface, end_x, end_y, length * 0.7, angle - 0.3, depth - 1)
-                draw_branch(surface, end_x, end_y, length * 0.7, angle + 0.3, depth - 1)
-
-            draw_branch(surf, center, size, size//4, -math.pi/2, 5)
-            
-        elif style == 'glitch':
-            # Digital Glitch: Random pixel blocks
-            for _ in range(40):
-                w = rng.randint(5, 30)
-                h = rng.randint(2, 10)
-                x = rng.randint(0, size - w)
-                y = rng.randint(0, size - h)
-                c_val = rng.randint(100, 255)
-                pygame.draw.rect(surf, (c_val, c_val, c_val, 200), (x, y, w, h))
-                
-                # Scanlines
-                if rng.random() > 0.5:
-                    pygame.draw.line(surf, (0, 0, 0, 100), (0, y), (size, y), 1)
-
-        return surf
-    
     def draw(self, screen):
         # Minimalist rendering: clean typography only
-        # 1. Draw subtle shadow for depth
-        shadow_color = (40, 40, 40)
-        shadow_surf = self.font.render(self.text, True, shadow_color)
         
-        # Rotate both shadow and text
-        shadow_surf = pygame.transform.rotate(shadow_surf, self.rotation)
+        # 1. Draw subtle shadow for depth
+        # Rotate pre-rendered shadow
+        shadow_surf = pygame.transform.rotate(self.original_shadow, self.rotation)
         shadow_rect = shadow_surf.get_rect(center=(int(self.x + 2), int(self.y + 2)))
         screen.blit(shadow_surf, shadow_rect)
         
         # 2. Draw main text with rotation
-        text_surf = self.font.render(self.text, True, FONT_COLOR)
-        text_surf = pygame.transform.rotate(text_surf, self.rotation)
+        # Rotate pre-rendered text
+        text_surf = pygame.transform.rotate(self.original_text, self.rotation)
         text_rect = text_surf.get_rect(center=(int(self.x), int(self.y)))
         screen.blit(text_surf, text_rect)
+
+class Particle:
+    """Small geometric particle for explosion effects."""
+    def __init__(self, x, y):
+        self.x = x + random.uniform(-20, 20) # Slight offset from center
+        self.y = y + random.uniform(-20, 20)
+        self.vx = random.uniform(-0.2, 0.2) # Very slow drift
+        self.vy = random.uniform(-0.2, 0.2)
+        self.life = 1.0
+        self.decay = random.uniform(0.01, 0.03) # Slow fade
+        self.size = random.randint(6, 15) # Larger size for visibility
+        self.shape = random.choice(['circle', 'rect', 'triangle'])
+        self.color_val = random.randint(200, 255) # Bright
+        self.color = (self.color_val, self.color_val, self.color_val)
+
+    def update(self):
+        self.x += self.vx
+        self.y += self.vy
+        self.life -= self.decay
+        # No size shrinking, just fade out
+
+    def draw(self, screen):
+        if self.life <= 0:
+            return
+        
+        alpha = int(self.life * 255)
+        s = pygame.Surface((int(self.size * 2), int(self.size * 2)), pygame.SRCALPHA)
+        
+        c = (*self.color, alpha)
+        
+        if self.shape == 'circle':
+            pygame.draw.circle(s, c, (self.size, self.size), self.size, width=1)
+        elif self.shape == 'rect':
+            pygame.draw.rect(s, c, (0, 0, self.size*2, self.size*2), width=1)
+        elif self.shape == 'triangle':
+            points = [(self.size, 0), (0, self.size*2), (self.size*2, self.size*2)]
+            pygame.draw.polygon(s, c, points, width=1)
+            
+        screen.blit(s, (int(self.x - self.size), int(self.y - self.size)))
 
 class NLPManager:
     """Handles text analysis."""
@@ -292,9 +238,17 @@ class NLPManager:
             print(f"TTS Error: {e}")
 
 class PrinterManager:
-    """Handles thermal printer output."""
+    """Handles thermal printer output asynchronously."""
     def __init__(self):
         self.printer = None
+        self.print_queue = deque()
+        self.is_printing = False
+        self.lock = threading.Lock()
+        
+        # Start background worker thread
+        self.worker_thread = threading.Thread(target=self._print_worker, daemon=True)
+        self.worker_thread.start()
+
         if HAS_ESCPOS:
             try:
                 # Attempt to connect to Epson TM-T88V via USB (vendor 0x04b8, product 0x0e15)
@@ -313,31 +267,69 @@ class PrinterManager:
         else:
             print("[PRINTER] escpos library not available, printer disabled.")
     
-    def print_receipt(self, words_data):
-        """Print words with an echo/ghost effect to simulate a stretched typographic style.
-        Each word is printed multiple times with incremental left offset, creating a trailing visual.
-        """
+    def _print_worker(self):
+        """Background thread to handle print jobs."""
+        while True:
+            if self.print_queue:
+                job = None
+                with self.lock:
+                    if self.print_queue:
+                        job = self.print_queue.popleft()
+                
+                if job:
+                    self.is_printing = True
+                    try:
+                        self._execute_print(job)
+                    except Exception as e:
+                        print(f"[PRINTER] Error in print worker: {e}")
+                    finally:
+                        self.is_printing = False
+            
+            time.sleep(0.1)  # Prevent busy waiting
+
+    def _execute_print(self, words_data):
+        """Actual printing logic (runs in background thread)."""
         if not self.printer:
-            print("[PRINTER] No printer available – skipping actual print.")
             return
+
         try:
+            # Initialize printer settings for high speed
+            # self.printer._raw(b'\x1b\x40') # Initialize
+            
             # Header
             self.printer.text("Thermal Poetry\n")
             self.printer.text("-" * 30 + "\n")
+            
             for item in words_data:
                 raw = item.text if isinstance(item, Word) else str(item)
+                
+                # Echo effect logic
                 max_offset = 4
                 for offset in range(max_offset + 1):
                     line = " " * offset + raw
                     self.printer.text(f"{line}\n")
-            self.printer.cut()
+            
+            # Feed and Full Cut
+            self.printer.text("\n\n\n")
+            self.printer.cut(mode='FULL') 
+            
             print(f"[PRINTER] Printed with echo effect: {[item.text if isinstance(item, Word) else item for item in words_data]}")
+            
         except Exception as e:
-            # If the USB backend raises a RuntimeError (missing libusb), fall back to dummy output
             print(f"[PRINTER] Print failed ({e}); falling back to console output.")
             for item in words_data:
                 raw = item.text if isinstance(item, Word) else str(item)
                 print(raw)
+
+    def print_receipt(self, words_data):
+        """Add print job to queue (Non-blocking)."""
+        if not self.printer:
+            print("[PRINTER] No printer available – skipping.")
+            return
+
+        with self.lock:
+            self.print_queue.append(words_data)
+        print(f"[PRINTER] Job queued. Queue size: {len(self.print_queue)}")
 
 
 class MicrophoneManager:
@@ -351,6 +343,7 @@ class MicrophoneManager:
         # FFT Energy tracking
         self.low_energy = 0.0
         self.high_energy = 0.0
+        self.voice_energy = 0.0
         
         try:
             # Initialize input stream
@@ -393,50 +386,47 @@ class MicrophoneManager:
             
             mag = np.abs(fft_data)
             
-            # Low Freq Energy (0 - 500Hz)
-            low_mask = (fft_freq < 500)
+            # Low Freq Energy (0 - 300Hz) - Rumble/Noise
+            low_mask = (fft_freq < 300)
             low_energy = np.sum(mag[low_mask])
             
-            # High Freq Energy (1000Hz - 5000Hz)
-            high_mask = (fft_freq > 1000) & (fft_freq < 5000)
-            high_energy = np.sum(mag[high_mask])
+            # Voice Band Energy (300Hz - 3400Hz) - Human Speech
+            voice_mask = (fft_freq >= 300) & (fft_freq < 3400)
+            voice_energy = np.sum(mag[voice_mask])
             
             self.low_energy = low_energy
-            self.high_energy = high_energy
+            self.voice_energy = voice_energy
             
         except Exception as e:
             print(f"FFT Error: {e}")
             self.low_energy = 0
-            self.high_energy = 0
+            self.voice_energy = 0
 
-    def is_blowing(self):
-        """Check if input matches breath characteristics."""
+    def is_speaking(self):
+        """Check if input matches human speech characteristics."""
         if not self.stream:
             return False
             
-        # Criteria for Blowing:
-        # 1. Volume > Threshold (Dynamic)
-        # 2. Dominant Low Frequency (Low Energy >> High Energy)
+        # Criteria for Speech:
+        # 1. Volume > Threshold
+        # 2. Significant energy in Voice Band (300-3400Hz)
         
-        # Increased thresholds for "Loud Voice/Blow" only
-        # This prevents accidental triggers from background noise
-        threshold = max(self.noise_floor + 0.5, 0.4)
+        # Threshold: Adjusted for voice projection
+        threshold = max(self.noise_floor + 0.5, 0.6)
         is_loud_enough = self.current_volume > threshold
         
-        # Ratio check: Breath is mostly low frequency
-        # Typing clicks have significant high frequency content
+        # Voice Presence Check
+        # Voice should have significant energy compared to low-end rumble
         # Avoid division by zero
-        ratio = self.low_energy / (self.high_energy + 0.001)
+        total_energy = self.low_energy + self.voice_energy + 0.001
+        voice_ratio = self.voice_energy / total_energy
         
-        # Very permissive ratio (1.5 -> 0.5)
-        # Wind guards cut low freq wind noise, so we must be lenient
-        is_low_freq_dominant = ratio > 0.5
+        # Speech usually has balanced or voice-band dominant energy
+        # Wind/Blow is very low-end dominant (ratio < 0.2)
+        # Speech should be > 0.3 approx
+        is_voice_freq = voice_ratio > 0.3
         
-        # Loudness Override: If very loud, be even more lenient on frequency
-        if self.current_volume > self.noise_floor * 4.0:
-             is_low_freq_dominant = ratio > 0.2
-        
-        return is_loud_enough and is_low_freq_dominant
+        return is_loud_enough and is_voice_freq
 
     def close(self):
         if self.stream:
@@ -573,6 +563,9 @@ class ThermalPoetryApp:
         # UI warning timer for left-ward drift (0..1)
         self.warning_timer = 0.0
         
+        # Particle System
+        self.particles = []
+        
         # Load some initial words
         initial_words = ["당신의", "언어는", "어항", "속에서", "타고", "있나요?"]
         for w in initial_words:
@@ -612,6 +605,7 @@ class ThermalPoetryApp:
         y = random.randint(100, SCREEN_HEIGHT - 100)
         word = Word(text, x, y, self.font)
         self.floating_words.append(word)
+        return word
 
     def log_to_file(self, text):
         """Log user input to log.md with timestamp."""
@@ -679,11 +673,17 @@ class ThermalPoetryApp:
                 remaining_queue.append((word, appear_time))
         
         # Add words to floating
-        for word in words_to_add:
-            self.add_floating_word(word)
+        for word_text in words_to_add:
+            new_word = self.add_floating_word(word_text)
+            self.create_explosion(new_word.x, new_word.y)
         
         # Update queue
         self.word_appear_queue = remaining_queue
+
+    def create_explosion(self, x, y):
+        """Create a minimal burst of particles at x, y."""
+        for _ in range(3): # Only 3 particles per word for minimalism
+            self.particles.append(Particle(x, y))
 
     def handle_input(self, event):
         self.last_input_time = time.time()
@@ -745,11 +745,17 @@ class ThermalPoetryApp:
             if current_time - self.deconstruction_start_time > EXPLOSION_DURATION:
                 self.switch_state(STATE_FLOATING)
 
+        # Update Particles
+        for p in self.particles[:]:
+            p.update()
+            if p.life <= 0:
+                self.particles.remove(p)
+
         # Update Logic based on State
         if self.state == STATE_FLOATING:
-            # Check Microphone Trigger
-            if self.mic.is_blowing():
-                print(f"[MIC] Blow detected! Volume: {self.mic.current_volume:.2f}")
+            # Check Microphone Trigger (Voice)
+            if self.mic.is_speaking():
+                print(f"[MIC] Voice detected! Volume: {self.mic.current_volume:.2f}")
                 self.switch_state(STATE_PRINTING)
                 self.printing_start_time = time.time()
                 
@@ -764,23 +770,23 @@ class ThermalPoetryApp:
         elif self.state == STATE_PRINTING:
             words_to_remove = []
             
-            # Continuous Wind Physics with Pressure
+            # Continuous Voice Physics
             
             # 1. Check Priority (Typing > Mic)
             is_typing = current_time < self.typing_cooldown
-            is_blowing = False
+            is_speaking = False
             
             if not is_typing:
-                is_blowing = self.mic.is_blowing()
+                is_speaking = self.mic.is_speaking()
             
-            # 2. Update Wind Pressure
-            # Pressure builds up when blowing, decays when not
-            if is_blowing:
-                # Moderate buildup (0.02 -> 0.04) - balanced for wind guard
-                self.wind_pressure += 0.04
+            # 2. Update "Voice Pressure"
+            # Pressure builds up when speaking, decays when not
+            if is_speaking:
+                # Faster buildup for speech (it's intermittent)
+                self.wind_pressure += 0.08
             else:
-                # Slower decay to be more forgiving
-                self.wind_pressure -= 0.02
+                # Slower decay to bridge gaps between words
+                self.wind_pressure -= 0.015
                 
             # Clamp pressure
             self.wind_pressure = max(0.0, min(1.0, self.wind_pressure))
@@ -863,7 +869,7 @@ class ThermalPoetryApp:
             # Apply subtle force with smooth fade-out to prevent jerking
             
             # Calculate target force strength
-            if is_blowing or self.wind_pressure > 0:
+            if is_speaking or self.wind_pressure > 0:
                 target_force = (self.mic.current_volume * 0.2) + (self.wind_pressure * 0.3)
             else:
                 target_force = 0.0
@@ -896,6 +902,10 @@ class ThermalPoetryApp:
         trail_surface.fill((0, 0, 0, 15))  # Very subtle fade (15/255 opacity)
         self.screen.blit(trail_surface, (0, 0))
         
+        # Draw Particles (Global)
+        for p in self.particles:
+            p.draw(self.screen)
+        
         if self.state == STATE_FLOATING or self.state == STATE_PRINTING:
             
             # Screen Shake (Global Offset)
@@ -914,11 +924,11 @@ class ThermalPoetryApp:
                 word.draw(self.screen)
                 word.x, word.y = original_x, original_y # Restore
             
-            # Visual feedback for blowing (Subtle Circle)
-            # Only show if actually blowing (above threshold)
-            is_blowing = self.mic.is_blowing()
+            # Visual feedback for Voice (Subtle Circle)
+            # Only show if actually speaking (above threshold)
+            is_speaking = self.mic.is_speaking()
             
-            if is_blowing:
+            if is_speaking:
                 # Draw indicator
                 indicator_radius = int(self.mic.current_volume * 100)
                 s = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
