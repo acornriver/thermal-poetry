@@ -8,6 +8,7 @@ from collections import deque
 import threading
 from PIL import Image, ImageOps
 import sounddevice as sd
+import subprocess
 
 
 # Try imports for hardware/NLP, fallback if missing for development
@@ -76,6 +77,9 @@ class Word:
         # Base position (for wave calculation)
         self.base_x = x
         self.base_y = y
+        
+        # Consistent Physical Properties
+        self.mass = random.uniform(0.8, 1.2) # Consistent weight per word
 
         # --- CACHING: Pre-render surfaces ---
         # 1. Shadow
@@ -333,24 +337,29 @@ class PrinterManager:
 
 
 class MicrophoneManager:
-    """Handles microphone input for breath detection with dynamic threshold."""
-    def __init__(self):
+    """Handles microphone input with lowered thresholds for Recitation."""
+    def __init__(self, device_index=None):
         self.stream = None
         self.current_volume = 0
-        self.noise_floor = 0.2  # Initial estimate of background noise
-        self.alpha = 0.01       # Slow adaptation rate for noise floor
+        self.smoothed_volume = 0.0
+        self.noise_floor = 0.1  # 낮춤 (0.2 -> 0.1)
+        self.alpha = 0.01
         
         # FFT Energy tracking
         self.low_energy = 0.0
         self.high_energy = 0.0
         self.voice_energy = 0.0
         
+        # Debug helper
+        self.debug_timer = 0
+        
         try:
-            # Initialize input stream
             self.stream = sd.InputStream(callback=self.audio_callback,
                                        channels=1,
                                        samplerate=44100,
-                                       blocksize=1024)
+                                       blocksize=1024, # 정밀도를 위해 샘플 사이즈 증가
+                                       latency='low',
+                                       device=device_index)
             self.stream.start()
             print("[MIC] Microphone initialized successfully")
         except Exception as e:
@@ -358,12 +367,86 @@ class MicrophoneManager:
             self.stream = None
 
     def audio_callback(self, indata, frames, time, status):
+        if status:
+            print(status)
+        
+        # Calculate RMS volume
+        # 증폭 계수 증가 (10 -> 15) : 작은 목소리도 더 크게 인식되도록
+        volume = np.linalg.norm(indata) * 15
+        self.current_volume = volume
+        
+        # Fast Attack, Slow Decay Smoothing
+        # 말할 때는 즉각 반응(0.2 old), 멈출 때는 천천히 감소(0.9 old)
+        if volume > self.smoothed_volume:
+            self.smoothed_volume = self.smoothed_volume * 0.2 + volume * 0.8
+        else:
+            self.smoothed_volume = self.smoothed_volume * 0.9 + volume * 0.1
+        
+        # Update Noise Floor (Adaptive)
+        if volume < self.noise_floor * 1.5:
+            self.noise_floor = self.noise_floor * (1 - self.alpha) + volume * self.alpha
+            
+        # FFT Analysis
+        try:
+            windowed_data = indata[:, 0] * np.hanning(len(indata))
+            fft_data = np.fft.rfft(windowed_data)
+            fft_freq = np.fft.rfftfreq(len(windowed_data), d=1/44100)
+            
+            mag = np.abs(fft_data)
+            
+            # Voice Band (Human speech fundamental freq is ~85Hz to ~255Hz)
+            # Broaden the range to capture harmonics
+            voice_mask = (fft_freq >= 100) & (fft_freq < 3000)
+            self.voice_energy = np.sum(mag[voice_mask])
+            self.total_energy = np.sum(mag)
+            
+        except Exception as e:
+            self.voice_energy = 0
+            self.total_energy = 1
+
+    def is_speaking(self):
+        if not self.stream:
+            return False
+            
+        # --- Threshold Tuning (Relaxed) ---
+        
+        # 1. Volume Check
+        # 절대적인 최소 기준을 대폭 낮춤 (0.8 -> 0.3)
+        # 낭독은 '속삭임'일 수도 있으므로 낮게 잡아야 함
+        min_threshold = 0.3 + (self.noise_floor * 0.5)
+        is_loud_enough = self.smoothed_volume > min_threshold
+        
+        # 2. Frequency Check (Relaxed)
+        # 목소리 비율 기준 완화 (0.3 -> 0.15)
+        # 주변 소음이 있어도 목소리 에너지가 조금이라도 감지되면 통과
+        ratio = self.voice_energy / (self.total_energy + 0.001)
+        is_voice_freq = ratio > 0.15
+        
+        # --- DEBUG LOGGING ---
+        # 0.5초마다 터미널에 현재 상태를 출력해서 튜닝을 돕습니다.
+        import time
+        if time.time() - self.debug_timer > 0.5:
+            state = "SPEAKING" if (is_loud_enough and is_voice_freq) else "..."
+            print(f"[{state}] Vol: {self.smoothed_volume:.2f}/{min_threshold:.2f} | Ratio: {ratio:.2f}")
+            self.debug_timer = time.time()
+        
+        return is_loud_enough and is_voice_freq
+
+    def close(self):
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+    def audio_callback(self, indata, frames, time, status):
         """Called by sounddevice for each audio block."""
         if status:
             print(status)
         # Calculate RMS volume
         volume = np.linalg.norm(indata) * 10
         self.current_volume = volume
+        
+        # Apply smoothing (Moving Average)
+        # 0.7 = keep 70% of old value, 0.3 = take 30% of new value
+        self.smoothed_volume = self.smoothed_volume * 0.7 + volume * 0.3
         
         # Dynamic Noise Floor Adaptation
         # We assume background noise is relatively steady and lower than "blowing"
@@ -411,9 +494,17 @@ class MicrophoneManager:
         # 1. Volume > Threshold
         # 2. Significant energy in Voice Band (300-3400Hz)
         
-        # Threshold: Adjusted for voice projection
-        threshold = max(self.noise_floor + 0.5, 0.6)
-        is_loud_enough = self.current_volume > threshold
+        # Threshold: Adaptive Algorithm
+        # Scales sensitivity based on ambient noise
+        # 1. Dynamic Margin: Increases in noisy environments (0.3 base + 30% of noise)
+        dynamic_margin = 0.3 + (self.noise_floor * 0.3)
+        
+        # 2. Minimum Floor: Raises the absolute floor in loud places
+        min_threshold = 0.8 + (self.noise_floor * 0.1)
+        
+        threshold = max(self.noise_floor + dynamic_margin, min_threshold)
+        # Use SMOOTHED volume for detection to prevent flickering
+        is_loud_enough = self.smoothed_volume > threshold
         
         # Voice Presence Check
         # Voice should have significant energy compared to low-end rumble
@@ -503,12 +594,21 @@ class ThermalPoetryApp:
         sound = pygame.sndarray.make_sound(np.array(buf, dtype=np.int16))
         return sound
 
-    def __init__(self):
+    def __init__(self, mic_device_index=None):
         pygame.init()
         pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
         
         # Setup Screen
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.FULLSCREEN)
+        
+        # Setup Persistent Canvas for Trails
+        self.canvas = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+        self.canvas.fill(BG_COLOR)
+        
+        # Pre-create fade surface
+        self.fade_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        self.fade_surface.fill((0, 0, 0, 15))  # Very subtle fade
+        
         pygame.display.set_caption("Thermal Poetry")
         
         # Setup Font
@@ -517,7 +617,7 @@ class ThermalPoetryApp:
         # Managers
         self.nlp = NLPManager()
         self.printer = PrinterManager()
-        self.mic = MicrophoneManager()
+        self.mic = MicrophoneManager(device_index=mic_device_index)
         
         # Application State
         self.state = STATE_FLOATING
@@ -575,11 +675,12 @@ class ThermalPoetryApp:
         """Attempt to find a system font that supports Korean."""
         # List of font names to try - prioritizing serif fonts used by writers/artists
         font_candidates = [
+            "applemyungjo",   # Mac serif fonts (Book style)
             "nanummyeongjo", "nanummyeongjocoding",  # Nanum Myeongjo - elegant serif
             "notoserifcjkkr", "notoserifkr",  # Noto Serif - professional serif
-            "applemyungjo", "applegothic",  # Mac serif fonts
+            "applesdgothicneo", # Modern Mac Gothic - standard and reliable
+            "applegothic", # Older Mac Gothic
             "batang", "batangche",  # Windows traditional serif
-            "applesdgothicneo",  # Fallback to gothic if no serif available
             "malgun", "malgungothic",  # Windows
             "nanumgothic",  # Fallback gothic
         ]
@@ -807,9 +908,10 @@ class ThermalPoetryApp:
                     # Direct Launch (No Recoil)
                     # Force is negative (Left)
                     # Scale force by pressure directly
-                    # Reduced speed (2.5 -> 1.5) for gentler flow
-                    launch_strength = self.wind_pressure * 0.5 
-                    word.vx -= launch_strength * random.uniform(0.8, 1.2)
+                    # Adjusted speed (0.5 -> 1.2) for balanced visibility and impact
+                    launch_strength = self.wind_pressure * 2
+                    # Use consistent mass instead of random per frame
+                    word.vx -= launch_strength * word.mass
                     
                     # Vertical turbulence
                     word.vy += random.uniform(-0.5, 0.5) * launch_strength
@@ -827,7 +929,8 @@ class ThermalPoetryApp:
                     words_moving = True
                 
                 # Check bounds (Off-screen Left)
-                if word.x < -200:
+                # Fix: Allow words to fly further off-screen before removal so the visual is clear
+                if word.x < -500:
                     words_to_remove.append(word)
 
             # 4. Remove collected words and Print
@@ -848,14 +951,9 @@ class ThermalPoetryApp:
                 if current_time - self.last_input_time > 1.0:
                     self.switch_state(STATE_FLOATING)
             
-            # 5. Return to Floating if idle
-            # If pressure is zero AND words have stopped moving
-            if self.wind_pressure <= 0 and not words_moving:
-                if current_time - self.last_input_time > 1.0:
-                    self.switch_state(STATE_FLOATING)
-            
             # After applying forces, detect leftward movement for UI cue
-            self.left_moving = any(word.vx < -0.02 for word in self.floating_words)
+            # Fix: Increase threshold to -0.5 so it only triggers when actually being blown away
+            self.left_moving = any(word.vx < -0.5 for word in self.floating_words)
             # Update warning timer: fade in when drifting left, fade out otherwise
             if self.left_moving:
                 self.warning_timer = min(self.warning_timer + 0.07, 1.0)
@@ -869,13 +967,20 @@ class ThermalPoetryApp:
             # Apply subtle force with smooth fade-out to prevent jerking
             
             # Calculate target force strength
+            # Calculate target force strength
             if is_speaking or self.wind_pressure > 0:
                 target_force = (self.mic.current_volume * 0.2) + (self.wind_pressure * 0.3)
             else:
                 target_force = 0.0
             
-            # Smoothly interpolate to target (prevents sudden jerks)
-            smoothing = 0.15  # Lower = smoother but slower response
+            # --- Inertia of Voice: Asymmetric Smoothing ---
+            # Attack (Speaking): Fast response to capture the start of speech
+            # Release (Silence): Slow decay to let words drift with inertia
+            if target_force > self.smoothed_force:
+                smoothing = 0.3  # Fast Attack
+            else:
+                smoothing = 0.02 # Very Slow Release (Long Inertia)
+                
             self.smoothed_force += (target_force - self.smoothed_force) * smoothing
             
             # Only apply force if it's significant
@@ -896,15 +1001,12 @@ class ThermalPoetryApp:
 
 
     def draw(self):
-        # Motion blur effect: semi-transparent black overlay instead of full clear
-        # This creates ethereal trails as words move
-        trail_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-        trail_surface.fill((0, 0, 0, 15))  # Very subtle fade (15/255 opacity)
-        self.screen.blit(trail_surface, (0, 0))
+        # 1. Apply Fade to Canvas (Persistent Trails)
+        self.canvas.blit(self.fade_surface, (0, 0))
         
-        # Draw Particles (Global)
+        # 2. Draw Particles on Canvas
         for p in self.particles:
-            p.draw(self.screen)
+            p.draw(self.canvas)
         
         if self.state == STATE_FLOATING or self.state == STATE_PRINTING:
             
@@ -916,50 +1018,84 @@ class ThermalPoetryApp:
                 shake_x = random.uniform(-shake_intensity, shake_intensity)
                 shake_y = random.uniform(-shake_intensity, shake_intensity)
 
+            # 3. Draw Words on Canvas
+            # 2.5 Draw Audio Visualizer on Canvas (Behind Words)
+            # Smooth animation for the circle
+            target_radius = self.mic.smoothed_volume * 100 if self.mic.is_speaking() else 0
+            
+            # Initialize if not exists
+            if not hasattr(self, 'visualizer_radius'):
+                self.visualizer_radius = 0.0
+                
+            # Smooth interpolation (Lerp) for fluid movement
+            self.visualizer_radius += (target_radius - self.visualizer_radius) * 0.1
+            
+            if self.visualizer_radius > 1.0:
+                s = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+                
+                # White with low alpha (Subtle ripple effect)
+                color = (255, 255, 255, 30)
+                
+                # Draw circle with width=1 for very thin outline
+                pygame.draw.circle(s, color, (SCREEN_WIDTH//2, SCREEN_HEIGHT//2), int(self.visualizer_radius), width=1)
+                self.canvas.blit(s, (0,0))
+
+            # 3. Draw Words on Canvas
             for word in self.floating_words:
                 # Draw with shake offset
                 original_x, original_y = word.x, word.y
                 word.x += shake_x
                 word.y += shake_y
-                word.draw(self.screen)
+                word.draw(self.canvas)
                 word.x, word.y = original_x, original_y # Restore
             
-            # Visual feedback for Voice (Subtle Circle)
-            # Only show if actually speaking (above threshold)
-            is_speaking = self.mic.is_speaking()
+            # 4. Blit Canvas to Screen (Base Layer)
+            self.screen.blit(self.canvas, (0, 0))
             
-            if is_speaking:
-                # Draw indicator
-                indicator_radius = int(self.mic.current_volume * 100)
-                s = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-                
-                # Very subtle grey
-                color = (150, 150, 150, 50)
-                
-                # Draw circle with width=1 for very thin outline
-                pygame.draw.circle(s, color, (SCREEN_WIDTH//2, SCREEN_HEIGHT//2), indicator_radius, width=1)
-                self.screen.blit(s, (0,0))
+            # 5. Draw UI Elements on Screen (No Trails)
+            
+            # (Visualizer moved to step 2.5)
             
             # Render leftward movement warning if needed
             # Artistic warning UI when words drift left
-            if getattr(self, 'left_moving', False) or self.warning_timer > 0.01:
+            # Render leftward movement warning if needed
+            # Artistic warning UI when words drift left
+            # Fix: Only draw if timer is significant (> 0.05) to prevent faint ghosting
+            if self.warning_timer > 0.05:
                 # Fade & slide animation based on warning_timer (0..1)
                 progress = self.warning_timer  # 0 = invisible, 1 = fully visible
                 # Text
                 warning_text = "언어가 감열소각장으로 이동중입니다..."
                 warning_surf = self.font.render(warning_text, True, (255, 120, 120))
                 # Apply alpha for fade effect
-                warning_surf.set_alpha(int(200 * progress))
+                # warning_surf.set_alpha(int(200 * progress)) # Removed alpha to prevent box artifact
+                
+                # Use color interpolation for text fade instead of alpha
+                text_alpha = int(255 * progress)
+                text_color = (
+                    int(255 * progress), 
+                    int(120 * progress), 
+                    int(120 * progress)
+                )
+                warning_surf = self.font.render(warning_text, True, text_color, (0,0,0))
+                warning_surf.set_colorkey((0,0,0)) # Make black background transparent
+                
                 # Background glow (soft semi-transparent rectangle)
                 glow_surf = pygame.Surface((warning_surf.get_width() + 20,
                                           warning_surf.get_height() + 12),
                                          pygame.SRCALPHA)
-                glow_color = (30, 0, 0, int(120 * progress))
+                
+                # Fix: Ensure glow fades out completely
+                glow_alpha = int(120 * progress)
+                glow_color = (30, 0, 0, glow_alpha)
+                
                 pygame.draw.rect(glow_surf, glow_color, glow_surf.get_rect(), border_radius=6)
+                
                 # Combine glow + text
                 combined = pygame.Surface(glow_surf.get_size(), pygame.SRCALPHA)
                 combined.blit(glow_surf, (0, 0))
                 combined.blit(warning_surf, (10, 6))
+                
                 # Slide from right: start slightly off-screen and move left as it appears
                 slide_offset = int((1 - progress) * 40)  # 40px slide distance
                 warning_rect = combined.get_rect()
@@ -986,12 +1122,22 @@ class ThermalPoetryApp:
                     else:
                         guide_text = "아무 텍스트나 적어 보세요..."
                     
-                guide_surf = self.font.render(guide_text, True, (100, 100, 100))
-                guide_surf.set_alpha(alpha)
-                guide_rect = guide_surf.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2))
+                # Fix: Simulate fade by changing text color (darker) instead of alpha
+                # This prevents the "gray box" artifact on the black background
+                color_val = int(100 * (alpha / 255))
+                guide_color = (color_val, color_val, color_val)
+                
+                # Render with SOLID BLACK background to prevent any transparency artifacts
+                guide_surf = self.font.render(guide_text, True, guide_color, (0, 0, 0))
+                
+                # Moved down slightly to avoid overlap with warning UI
+                guide_rect = guide_surf.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 80))
                 self.screen.blit(guide_surf, guide_rect)
                 
         elif self.state == STATE_TYPING:
+            # Clear screen for typing (clean look)
+            self.screen.fill(BG_COLOR)
+            
             # Show Typing Text
             display_text = self.input_text + self.composition_text
             if not display_text:
@@ -1008,9 +1154,15 @@ class ThermalPoetryApp:
             self.screen.blit(guide_surf, guide_rect)
                 
         elif self.state == STATE_DECONSTRUCTION:
-            # Show words scattering
+            # 1. Apply Fade to Canvas
+            self.canvas.blit(self.fade_surface, (0, 0))
+            
+            # 2. Draw words scattering on Canvas
             for word in self.floating_words:
-                word.draw(self.screen)
+                word.draw(self.canvas)
+            
+            # 3. Blit to Screen
+            self.screen.blit(self.canvas, (0, 0))
                 
         pygame.display.flip()
 
@@ -1038,6 +1190,36 @@ class ThermalPoetryApp:
         pygame.quit()
         sys.exit()
 
+def select_audio_device():
+    """List audio devices and ask user to select one."""
+    print("\n--- Audio Input Devices ---")
+    devices = sd.query_devices()
+    input_devices = []
+    
+    for i, device in enumerate(devices):
+        if device['max_input_channels'] > 0:
+            input_devices.append((i, device['name']))
+            print(f"[{i}] {device['name']}")
+            
+    if not input_devices:
+        print("No input devices found. Using default.")
+        return None
+        
+    while True:
+        try:
+            selection = input("Select microphone device index: ")
+            if not selection: # Default if empty
+                return None
+            index = int(selection)
+            # Verify it's a valid input device
+            if any(d[0] == index for d in input_devices):
+                return index
+            else:
+                print("Invalid index. Please choose from the list.")
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+
 if __name__ == "__main__":
-    app = ThermalPoetryApp()
+    mic_index = select_audio_device()
+    app = ThermalPoetryApp(mic_device_index=mic_index)
     app.run()
