@@ -533,8 +533,6 @@ class ThermalPoetryApp:
         self.state = STATE_FLOATING
         self.last_input_time = time.time()
         
-        # Receipt preview flag
-        self.show_receipt_preview = False
         # Text Input State
         self.input_text = "" 
         self.composition_text = ""
@@ -721,12 +719,7 @@ class ThermalPoetryApp:
                     self.composition_text = ""
                 
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_r:
-                    # Toggle receipt preview mode
-                    self.show_receipt_preview = not self.show_receipt_preview
-                    print(f"[DEBUG] Receipt preview {'ON' if self.show_receipt_preview else 'OFF'}")
-                # Existing handling for other keys remains unchanged
-                elif event.key == pygame.K_RETURN:
+                if event.key == pygame.K_RETURN:
                     self.switch_state(STATE_DECONSTRUCTION)
                 elif event.key == pygame.K_BACKSPACE:
                     # Only handle backspace if no composition is active (IME handles composition backspace)
@@ -964,14 +957,6 @@ class ThermalPoetryApp:
                 warning_rect.centery = SCREEN_HEIGHT // 2
                 self.screen.blit(combined, warning_rect)
             
-            # Render receipt preview if enabled
-            if getattr(self, 'show_receipt_preview', False):
-                self.render_receipt_preview(self.printed_words)
-                # Skip other UI elements while preview is shown
-                pygame.display.flip()
-                return
-            # Existing drawing logic continues below
-
             # Guidance Text (Dynamic & Fading)
             # Only show in Floating state
             if self.state == STATE_FLOATING:
@@ -1019,33 +1004,6 @@ class ThermalPoetryApp:
                 
         pygame.display.flip()
 
-    def render_receipt_preview(self, words_data):
-        """Draw an on-screen preview of the receipt with the echo effect.
-        This mimics the actual printer output so you can see it directly.
-        """
-        # Simple white background rectangle
-        preview_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-        preview_surface.fill((255, 255, 255))
-        y = 20
-        line_height = self.font.get_height() + 4
-        # Header
-        header = self.font.render("Thermal Poetry", True, (0, 0, 0))
-        preview_surface.blit(header, (20, y))
-        y += line_height
-        preview_surface.blit(self.font.render("-" * 30, True, (0, 0, 0)), (20, y))
-        y += line_height
-        # Echo lines for each word
-        max_offset = 4
-        for item in words_data:
-            raw = item.text if isinstance(item, Word) else str(item)
-            for offset in range(max_offset + 1):
-                line = " " * offset + raw
-                txt = self.font.render(line, True, (0, 0, 0))
-                preview_surface.blit(txt, (20, y))
-                y += line_height
-        # Blit preview onto main screen
-        self.screen.blit(preview_surface, (0, 0))
-        
     def run(self):
         """Main application loop (windowed mode)."""
         # Set to windowed mode for development, can be changed to FULLSCREEN
